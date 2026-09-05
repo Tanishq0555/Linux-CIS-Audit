@@ -130,3 +130,133 @@ check_ssh_maxauthtries() {
         report "$id" FAIL "$title" "MaxAuthTries is '${value:-unset}', expected <= 4"
     fi
 }
+
+# ---------------------------------------------------------------------
+# SUDO-01  Ensure sudo commands use pty
+# CIS ID:    <look up in your benchmark PDF>
+# Rationale: use_pty forces every sudo command to run in a pseudo-terminal,
+#            which prevents a user from backgrounding a sudo session and
+#            slipping malicious input to it later, and improves session
+#            logging fidelity.
+# Impact:    Negligible — nearly transparent to normal interactive use.
+#            Can occasionally affect non-interactive automation that pipes
+#            input into sudo in unusual ways.
+# ---------------------------------------------------------------------
+check_sudo_use_pty() {
+    local id="SUDO-01" title="sudo use_pty enabled"
+
+    # Check /etc/sudoers and every file under /etc/sudoers.d/ — the setting
+    # can legitimately live in either place.
+    if grep -Eq '^\s*Defaults\s+use_pty\s*$' /etc/sudoers /etc/sudoers.d/* 2>/dev/null; then
+        report "$id" PASS "$title"
+    else
+        report "$id" FAIL "$title" "'Defaults use_pty' not found in /etc/sudoers or /etc/sudoers.d/"
+    fi
+}
+
+# ---------------------------------------------------------------------
+# PW-01  Ensure password expiration is 365 days or less
+# CIS ID:    <look up in your benchmark PDF>
+# Rationale: Forces periodic password rotation, limiting how long a leaked
+#            or guessed credential stays valid.
+# Impact:    Users will be prompted to change passwords periodically.
+#            Some teams argue this control is outdated (NIST 800-63B has
+#            moved away from mandatory rotation) — worth knowing as a
+#            talking point even though CIS still includes it.
+# ---------------------------------------------------------------------
+check_pw_max_days() {
+    local id="PW-01" title="Password max age <= 365 days"
+    local value
+
+    value=$(awk '$1=="PASS_MAX_DAYS" {print $2}' /etc/login.defs 2>/dev/null)
+
+    if [[ "$value" =~ ^[0-9]+$ ]] && [[ "$value" -le 365 ]]; then
+        report "$id" PASS "$title"
+    else
+        report "$id" FAIL "$title" "PASS_MAX_DAYS is '${value:-unset}', expected <= 365"
+    fi
+}
+
+# ---------------------------------------------------------------------
+# PAM-01  Ensure account lockout (faillock) is configured
+# CIS ID:    <look up in your benchmark PDF>
+# Rationale: Without a lockout policy, an attacker can attempt unlimited
+#            password guesses against a local or SSH-exposed account.
+# Impact:    Legitimate users who mistype their password too many times
+#            will be locked out until the fail_interval expires. This is
+#            THE control most likely to lock you out while testing —
+#            audit-only here, remediation happens later with a safety net.
+# Distro:    Rocky 9 manages the PAM stack via authselect — hand-editing
+#            /etc/pam.d/system-auth directly gets silently overwritten.
+#            Ubuntu edits /etc/pam.d/common-auth directly instead.
+# ---------------------------------------------------------------------
+check_pam_faillock() {
+    local id="PAM-01" title="Account lockout (faillock) configured"
+
+    if [[ ! -f /etc/security/faillock.conf ]]; then
+        report "$id" FAIL "$title" "/etc/security/faillock.conf not found"
+        return
+    fi
+
+    local deny_value
+    deny_value=$(awk -F= '$1=="deny" {gsub(/ /,"",$2); print $2}' /etc/security/faillock.conf)
+
+    if [[ -z "$deny_value" ]] || [[ "$deny_value" -eq 0 ]]; then
+        report "$id" FAIL "$title" "deny is '${deny_value:-unset}' in faillock.conf (0 or unset = disabled)"
+        return
+    fi
+
+    # Confirm the module is actually wired into the PAM stack, not just configured
+    # in faillock.conf with nothing referencing it.
+    if [[ "$DISTRO_FAMILY" == "rhel" ]]; then
+        if grep -rq "pam_faillock.so" /etc/pam.d/system-auth /etc/pam.d/password-auth 2>/dev/null; then
+            report "$id" PASS "$title"
+        else
+            report "$id" FAIL "$title" "deny=$deny_value set, but pam_faillock.so not active in PAM stack"
+        fi
+    else
+        if grep -rq "pam_faillock.so" /etc/pam.d/common-auth 2>/dev/null; then
+            report "$id" PASS "$title"
+        else
+            report "$id" FAIL "$title" "deny=$deny_value set, but pam_faillock.so not active in PAM stack"
+        fi
+    fi
+}
+
+# ---------------------------------------------------------------------
+# PERM-01  Ensure /etc/shadow permissions are configured correctly
+# CIS ID:    <look up in your benchmark PDF>
+# Rationale: /etc/shadow holds password hashes. Wrong permissions let
+#            unprivileged users read hashes and crack them offline.
+# Impact:    None if already compliant. If not, tightening permissions
+#            can occasionally break older tools that assume group-read
+#            access — rare in practice.
+# Distro:    THE key divergence example. Rocky expects 0000 root:root.
+#            Ubuntu expects 0640 root:shadow, because Debian-family uses
+#            a dedicated 'shadow' group so utilities like chage can read
+#            it without full root.
+# ---------------------------------------------------------------------
+check_shadow_perms() {
+    local id="PERM-01" title="/etc/shadow permissions correct"
+    local perms owner group
+
+    read -r perms owner group < <(stat -Lc '%a %U %G' /etc/shadow)
+    # stat does not zero-pad octal mode (prints '0' not '000'), so pad before comparing.
+    printf -v perms '%03d' "$perms"
+
+    if [[ "$DISTRO_FAMILY" == "rhel" ]]; then
+        if [[ "$perms" == "000" ]] && [[ "$owner" == "root" ]] && [[ "$group" == "root" ]]; then
+            report "$id" PASS "$title"
+        else
+            report "$id" FAIL "$title" "Found ${perms} ${owner}:${group}, expected 000 root:root"
+        fi
+    elif [[ "$DISTRO_FAMILY" == "debian" ]]; then
+        if [[ "$perms" == "640" ]] && [[ "$owner" == "root" ]] && [[ "$group" == "shadow" ]]; then
+            report "$id" PASS "$title"
+        else
+            report "$id" FAIL "$title" "Found ${perms} ${owner}:${group}, expected 640 root:shadow"
+        fi
+    else
+        report "$id" SKIP "$title" "unknown distro family"
+    fi
+}
