@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2317  # check_* functions are invoked indirectly by name via declare -F in audit.sh, not called directly in this file
 # CIS control checks. Each check_* function is auto-discovered by audit.sh.
 
 # ---------------------------------------------------------------------
@@ -255,6 +256,286 @@ check_shadow_perms() {
             report "$id" PASS "$title"
         else
             report "$id" FAIL "$title" "Found ${perms} ${owner}:${group}, expected 640 root:shadow"
+        fi
+    else
+        report "$id" SKIP "$title" "unknown distro family"
+    fi
+}
+
+# ---------------------------------------------------------------------
+# SYS-01  Ensure IP forwarding is disabled
+# CIS ID:    <look up in your benchmark PDF>
+# Rationale: A host with IP forwarding enabled can route traffic between
+#            networks, effectively acting as a router. On a server that
+#            isn't meant to route traffic, this is unnecessary attack
+#            surface and can enable network pivoting if compromised.
+# Impact:    Breaks anything that legitimately needs this host to forward
+#            packets — most notably, Docker sets ip_forward=1 for its
+#            container networking to work. A container host will
+#            legitimately and correctly FAIL this control; that's exactly
+#            why CIS benchmarks have documented exception processes.
+# Note:      Checks BOTH the live running value and the persisted config,
+#            since a box can be compliant now and revert after reboot.
+#            Checking only one of these is a common mistake.
+# ---------------------------------------------------------------------
+check_ip_forward() {
+    local id="SYS-01" title="IP forwarding disabled (running + persistent)"
+    local running
+
+    running=$(sysctl -n net.ipv4.ip_forward 2>/dev/null)
+
+    if [[ "$running" != "0" ]]; then
+        report "$id" FAIL "$title" "running value is '${running:-unset}', expected 0"
+        return
+    fi
+
+    # Persistent value: search every sysctl config location for an explicit
+    # override. grep -h suppresses filenames since we only care if ANY
+    # file sets it to non-zero.
+    local persisted
+    persisted=$(grep -hE '^\s*net\.ipv4\.ip_forward\s*=' \
+        /etc/sysctl.conf /etc/sysctl.d/*.conf 2>/dev/null | tail -n1 | awk -F= '{gsub(/ /,"",$2); print $2}')
+
+    if [[ -n "$persisted" ]] && [[ "$persisted" != "0" ]]; then
+        report "$id" FAIL "$title" "running=0 but persisted config sets it to '$persisted' (will re-enable on reboot)"
+    else
+        report "$id" PASS "$title"
+    fi
+}
+
+# ---------------------------------------------------------------------
+# AUD-01  Ensure auditd is installed and enabled
+# CIS ID:    <look up in your benchmark PDF>
+# Rationale: auditd provides tamper-evident logging of security-relevant
+#            events (logins, privilege escalation, file access on watched
+#            paths). Without it, you have no forensic trail after an
+#            incident.
+# Impact:    Minor CPU/disk overhead for logging. Standard on hardened
+#            systems.
+# Distro:    Ships installed and enabled on Rocky by default. NOT
+#            installed by default on minimal Ubuntu — expect a SKIP or
+#            FAIL there, not a bug in the script.
+# ---------------------------------------------------------------------
+check_auditd_enabled() {
+    local id="AUD-01" title="auditd installed and enabled"
+
+    if ! command -v auditctl >/dev/null 2>&1; then
+        report "$id" FAIL "$title" "auditd is not installed"
+        return
+    fi
+
+    local state
+    state=$(systemctl is-enabled auditd 2>/dev/null)
+
+    if [[ "$state" == "enabled" ]]; then
+        report "$id" PASS "$title"
+    else
+        report "$id" FAIL "$title" "auditd is installed but not enabled (state: ${state:-unknown})"
+    fi
+}
+
+# ---------------------------------------------------------------------
+# AUD-02  Ensure audit rule exists for changes to sudoers
+# CIS ID:    <look up in your benchmark PDF>
+# Rationale: Sudo privilege escalation is one of the highest-value targets
+#            for an attacker. A watch rule on /etc/sudoers and
+#            /etc/sudoers.d ensures any modification is logged, giving
+#            you a trail if privileges are tampered with.
+# Impact:    None — pure logging addition.
+# ---------------------------------------------------------------------
+check_audit_sudoers_rule() {
+    local id="AUD-02" title="Audit rule watches sudoers changes"
+
+    if ! command -v auditctl >/dev/null 2>&1; then
+        report "$id" SKIP "$title" "auditd not installed"
+        return
+    fi
+
+    if grep -rq "/etc/sudoers" /etc/audit/rules.d/ 2>/dev/null; then
+        report "$id" PASS "$title"
+    else
+        report "$id" FAIL "$title" "no audit rule found watching /etc/sudoers"
+    fi
+}
+
+# ---------------------------------------------------------------------
+# MAC-01  Ensure a Mandatory Access Control system is enforcing
+# CIS ID:    <look up in your benchmark PDF>
+# Rationale: MAC (SELinux/AppArmor) confines what a compromised process
+#            can do even if an attacker gets code execution, by enforcing
+#            policy beyond standard Unix permissions.
+# Impact:    Can be significant if policy isn't tuned correctly for your
+#            applications — a common source of confusing "permission
+#            denied" errors that aren't really permission errors. Pair
+#            this control with knowing how to read an AVC denial log.
+# Distro:    RHEL family uses SELinux (getenforce). Debian family uses
+#            AppArmor (aa-status). This is the clearest branch point in
+#            the whole project.
+# ---------------------------------------------------------------------
+check_mac_enforcing() {
+    local id="MAC-01" title="Mandatory Access Control enforcing"
+
+    if [[ "$DISTRO_FAMILY" == "rhel" ]]; then
+        if ! command -v getenforce >/dev/null 2>&1; then
+            report "$id" FAIL "$title" "SELinux tools not installed"
+            return
+        fi
+        local state
+        state=$(getenforce 2>/dev/null)
+        if [[ "$state" == "Enforcing" ]]; then
+            report "$id" PASS "$title"
+        else
+            report "$id" FAIL "$title" "SELinux state is '$state', expected Enforcing"
+        fi
+    elif [[ "$DISTRO_FAMILY" == "debian" ]]; then
+        if ! command -v aa-status >/dev/null 2>&1; then
+            report "$id" FAIL "$title" "AppArmor tools not installed"
+            return
+        fi
+        if aa-status --enabled 2>/dev/null; then
+            report "$id" PASS "$title"
+        else
+            report "$id" FAIL "$title" "AppArmor is not enabled/enforcing"
+        fi
+    else
+        report "$id" SKIP "$title" "unknown distro family"
+    fi
+}
+
+# ---------------------------------------------------------------------
+# SYS-01  Ensure IP forwarding is disabled
+# CIS ID:    <look up in your benchmark PDF>
+# Rationale: A host with IP forwarding enabled can route traffic between
+#            networks, effectively acting as a router. On a server that
+#            isn't meant to route traffic, this is unnecessary attack
+#            surface and can enable network pivoting if compromised.
+# Impact:    Breaks anything that legitimately needs this host to forward
+#            packets — most notably, Docker sets ip_forward=1 for its
+#            container networking to work. A container host will
+#            legitimately and correctly FAIL this control; that's exactly
+#            why CIS benchmarks have documented exception processes.
+# Note:      Checks BOTH the live running value and the persisted config,
+#            since a box can be compliant now and revert after reboot.
+#            Checking only one of these is a common mistake.
+# ---------------------------------------------------------------------
+check_ip_forward() {
+    local id="SYS-01" title="IP forwarding disabled (running + persistent)"
+    local running
+
+    running=$(sysctl -n net.ipv4.ip_forward 2>/dev/null)
+
+    if [[ "$running" != "0" ]]; then
+        report "$id" FAIL "$title" "running value is '${running:-unset}', expected 0"
+        return
+    fi
+
+    # Persistent value: search every sysctl config location for an explicit
+    # override. grep -h suppresses filenames since we only care if ANY
+    # file sets it to non-zero.
+    local persisted
+    persisted=$(grep -hE '^\s*net\.ipv4\.ip_forward\s*=' \
+        /etc/sysctl.conf /etc/sysctl.d/*.conf 2>/dev/null | tail -n1 | awk -F= '{gsub(/ /,"",$2); print $2}')
+
+    if [[ -n "$persisted" ]] && [[ "$persisted" != "0" ]]; then
+        report "$id" FAIL "$title" "running=0 but persisted config sets it to '$persisted' (will re-enable on reboot)"
+    else
+        report "$id" PASS "$title"
+    fi
+}
+
+# ---------------------------------------------------------------------
+# AUD-01  Ensure auditd is installed and enabled
+# CIS ID:    <look up in your benchmark PDF>
+# Rationale: auditd provides tamper-evident logging of security-relevant
+#            events (logins, privilege escalation, file access on watched
+#            paths). Without it, you have no forensic trail after an
+#            incident.
+# Impact:    Minor CPU/disk overhead for logging. Standard on hardened
+#            systems.
+# Distro:    Ships installed and enabled on Rocky by default. NOT
+#            installed by default on minimal Ubuntu — expect a SKIP or
+#            FAIL there, not a bug in the script.
+# ---------------------------------------------------------------------
+check_auditd_enabled() {
+    local id="AUD-01" title="auditd installed and enabled"
+
+    if ! command -v auditctl >/dev/null 2>&1; then
+        report "$id" FAIL "$title" "auditd is not installed"
+        return
+    fi
+
+    local state
+    state=$(systemctl is-enabled auditd 2>/dev/null)
+
+    if [[ "$state" == "enabled" ]]; then
+        report "$id" PASS "$title"
+    else
+        report "$id" FAIL "$title" "auditd is installed but not enabled (state: ${state:-unknown})"
+    fi
+}
+
+# ---------------------------------------------------------------------
+# AUD-02  Ensure audit rule exists for changes to sudoers
+# CIS ID:    <look up in your benchmark PDF>
+# Rationale: Sudo privilege escalation is one of the highest-value targets
+#            for an attacker. A watch rule on /etc/sudoers and
+#            /etc/sudoers.d ensures any modification is logged, giving
+#            you a trail if privileges are tampered with.
+# Impact:    None — pure logging addition.
+# ---------------------------------------------------------------------
+check_audit_sudoers_rule() {
+    local id="AUD-02" title="Audit rule watches sudoers changes"
+
+    if ! command -v auditctl >/dev/null 2>&1; then
+        report "$id" SKIP "$title" "auditd not installed"
+        return
+    fi
+
+    if grep -rq "/etc/sudoers" /etc/audit/rules.d/ 2>/dev/null; then
+        report "$id" PASS "$title"
+    else
+        report "$id" FAIL "$title" "no audit rule found watching /etc/sudoers"
+    fi
+}
+
+# ---------------------------------------------------------------------
+# MAC-01  Ensure a Mandatory Access Control system is enforcing
+# CIS ID:    <look up in your benchmark PDF>
+# Rationale: MAC (SELinux/AppArmor) confines what a compromised process
+#            can do even if an attacker gets code execution, by enforcing
+#            policy beyond standard Unix permissions.
+# Impact:    Can be significant if policy isn't tuned correctly for your
+#            applications — a common source of confusing "permission
+#            denied" errors that aren't really permission errors. Pair
+#            this control with knowing how to read an AVC denial log.
+# Distro:    RHEL family uses SELinux (getenforce). Debian family uses
+#            AppArmor (aa-status). This is the clearest branch point in
+#            the whole project.
+# ---------------------------------------------------------------------
+check_mac_enforcing() {
+    local id="MAC-01" title="Mandatory Access Control enforcing"
+
+    if [[ "$DISTRO_FAMILY" == "rhel" ]]; then
+        if ! command -v getenforce >/dev/null 2>&1; then
+            report "$id" FAIL "$title" "SELinux tools not installed"
+            return
+        fi
+        local state
+        state=$(getenforce 2>/dev/null)
+        if [[ "$state" == "Enforcing" ]]; then
+            report "$id" PASS "$title"
+        else
+            report "$id" FAIL "$title" "SELinux state is '$state', expected Enforcing"
+        fi
+    elif [[ "$DISTRO_FAMILY" == "debian" ]]; then
+        if ! command -v aa-status >/dev/null 2>&1; then
+            report "$id" FAIL "$title" "AppArmor tools not installed"
+            return
+        fi
+        if aa-status --enabled 2>/dev/null; then
+            report "$id" PASS "$title"
+        else
+            report "$id" FAIL "$title" "AppArmor is not enabled/enforcing"
         fi
     else
         report "$id" SKIP "$title" "unknown distro family"
