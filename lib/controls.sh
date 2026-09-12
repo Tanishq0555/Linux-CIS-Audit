@@ -200,7 +200,7 @@ check_pam_faillock() {
     fi
 
     local deny_value
-    deny_value=$(awk -F= '$1=="deny" {gsub(/ /,"",$2); print $2}' /etc/security/faillock.conf)
+    deny_value=$(awk -F= '{gsub(/ /,"",$1); if ($1=="deny") {gsub(/ /,"",$2); print $2}}' /etc/security/faillock.conf)
 
     if [[ -z "$deny_value" ]] || [[ "$deny_value" -eq 0 ]]; then
         report "$id" FAIL "$title" "deny is '${deny_value:-unset}' in faillock.conf (0 or unset = disabled)"

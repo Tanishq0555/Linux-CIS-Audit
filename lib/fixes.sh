@@ -172,7 +172,7 @@ fix_pam_faillock() {
     fi
 
     local deny_value
-    deny_value=$(awk -F= '$1=="deny" {gsub(/ /,"",$2); print $2}' /etc/security/faillock.conf 2>/dev/null)
+    deny_value=$(awk -F= '{gsub(/ /,"",$1); if ($1=="deny") {gsub(/ /,"",$2); print $2}}' /etc/security/faillock.conf 2>/dev/null)
 
     local wired=0
     if grep -rq "pam_faillock.so" /etc/pam.d/system-auth /etc/pam.d/password-auth 2>/dev/null; then
@@ -214,8 +214,8 @@ fix_pam_faillock() {
     for pf in /etc/pam.d/system-auth /etc/pam.d/password-auth; do
         backup_file "$pf"
         sed -i \
-            -e '/^auth\s\+sufficient\s\+pam_unix\.so/i auth        required      pam_faillock.so preauth silent deny=5 unlock_time=900' \
-            -e '/^auth\s\+sufficient\s\+pam_unix\.so/a auth        [default=die] pam_faillock.so authfail deny=5 unlock_time=900' \
+            -e '/^auth\s\+sufficient\s\+pam_unix\.so/i auth        required      pam_faillock.so preauth silent deny=5 unlock_time=900 even_deny_root' \
+            -e '/^auth\s\+sufficient\s\+pam_unix\.so/a auth        [default=die] pam_faillock.so authfail deny=5 unlock_time=900 even_deny_root' \
             "$pf"
         sed -i \
             -e '/^account\s\+required\s\+pam_unix\.so/i account     required      pam_faillock.so' \
