@@ -1,4 +1,154 @@
 # Linux CIS Benchmark Audit & Remediation Scripts
 
 Bash scripts that audit and remediate 12 CIS Benchmark controls on
-Rocky Linux 9 and Ubuntu 22.04.
+Rocky Linux 9 and Ubuntu 22.04 LTS.
+
+Built as a hands-on exercise to learn CIS Benchmark structure and
+cross-distro system administration — comparing how the same security
+control is implemented, defaults, and sometimes overridden differently
+across RHEL-family and Debian-family Linux.
+
+## What this does
+
+- **`audit.sh`** — read-only. Checks all 12 controls against the live
+  system and reports PASS/FAIL/SKIP for each, with a summary count.
+  Makes no changes.
+- **`remediate.sh`** — fixes non-compliant controls. Defaults to
+  `--dry-run` (shows what would change without changing it); requires
+  `--apply` to actually make changes. Backs up every file it touches
+  before modifying it.
+
+Both scripts auto-detect which distro family they're running on
+(`rhel` or `debian`) and branch their logic accordingly — no manual
+configuration needed to run the same codebase on either target.
+
+## Usage
+
+```bash
+# Clone and enter the repo
+git clone https://github.com/Tanishq0555/Linux-CIS-Audit.git
+cd Linux-CIS-Audit
+chmod +x audit.sh remediate.sh
+
+# Audit only — safe, read-only, run anytime
+sudo ./audit.sh
+
+# See what remediation would change, without changing anything
+sudo ./remediate.sh
+
+# Actually apply fixes
+sudo ./remediate.sh --apply
+```
+
+**Before running `--apply` for the first time on a new system:**
+- Take a VM snapshot or equivalent rollback point.
+- Keep a second, already-authenticated root/sudo session open in
+  another window. SSH and PAM changes can affect how new connections
+  authenticate — a live fallback session is how you'd recover if
+  something doesn't work as expected.
+- Confirm a non-root account with working `sudo` access exists and can
+  log in over SSH, before applying `SSH-01` (which disables root SSH
+  login entirely).
+
+## Controls covered
+
+| ID | Control | Rocky CIS ID | Ubuntu CIS ID |
+|---|---|---|---|
+| FS-01 | `/tmp` mounted with `noexec` | 1.1.2.1.4 | 1.1.2.1.4 |
+| PKG-01 | GPG signature checking (RHEL only) | 1.2.1.2 | N/A |
+| SSH-01 | Root login over SSH disabled | 5.1.21 | 5.1.22 |
+| SSH-02 | SSH `MaxAuthTries` ≤ 4 | 5.1.17 | 5.1.18 |
+| SUDO-01 | `sudo` commands use a pty | 5.2.4 | 5.2.2 |
+| PW-01 | Password max age ≤ 365 days | 5.4.1.1 | 5.4.1.1 |
+| PAM-01 | Account lockout (`faillock`) configured | 5.3.3.1.1 | 5.3.2.2 |
+| PERM-01 | `/etc/shadow` permissions correct | 7.1.5 | 7.1.5 |
+| SYS-01 | IP forwarding disabled | 3.3.1.1 | 3.3.1.1 |
+| AUD-01 | `auditd` installed and enabled | 6.2.1.4 | 6.2.1.2 |
+| AUD-02 | Audit rule watches `/etc/sudoers` | 6.2.3.1 | 6.2.3.1 |
+| MAC-01 | SELinux/AppArmor enforcing | 1.3.1.5 | 1.3.1.2 |
+
+Full detail for every control — rationale, audit method, remediation
+approach, and distro-specific notes — is in
+[`docs/controls.md`](docs/controls.md). NIST 800-53 and CIS Controls v8
+mappings, sourced directly from the benchmark PDFs, are in
+[`docs/nist-mapping.md`](docs/nist-mapping.md).
+
+## Distribution differences
+
+The interesting part of this project: the same security *intent* is
+implemented differently — sometimes very differently — depending on
+the underlying distro.
+
+- **PERM-01** — Rocky expects `/etc/shadow` at `0000 root:root`.
+  Ubuntu expects `0640 root:shadow`, since Debian-family systems use a
+  dedicated `shadow` group so utilities like `chage` can read the file
+  without full root access.
+- **PKG-01** — RHEL-family only. APT verifies repository signatures
+  through a keyring-based mechanism, not a per-repo config flag, so
+  this control correctly `SKIP`s on Ubuntu rather than being faked as
+  a pass.
+- **PAM-01** — Rocky's PAM stack (on this image) is managed as plain,
+  directly-editable files; Ubuntu's is managed by `pam-auth-update`,
+  but its own header documentation explicitly permits direct edits
+  around the managed block. Different mechanism, same end result.
+- **AUD-01** — Rocky ships `auditd` installed and enabled by default.
+  Ubuntu does not; remediation on Ubuntu requires an explicit package
+  install first.
+- **SUDO-01** — genuinely surprising: this control **failed by
+  default on Rocky** but **passed by default on Ubuntu 22.04** — the
+  opposite of what a RHEL-vs-Debian assumption might predict. Just a
+  difference in each distro's default sudoers packaging, not a
+  security-philosophy split.
+- **MAC-01** — the clearest structural divergence: Rocky uses SELinux
+  (`getenforce`), Ubuntu uses AppArmor (`aa-status`) — two entirely
+  different subsystems, not a shared config value with different
+  defaults.
+
+## Key finding: config inspection isn't always enough
+
+The most valuable discovery in this project (documented in full under
+SSH-01 in `docs/controls.md`): on Rocky, editing `/etc/ssh/sshd_config`
+directly to set `PermitRootLogin no`, and validating with `sshd -t`,
+still left root SSH login enabled. The cause was a drop-in file
+generated by Anaconda (Rocky's installer) at
+`/etc/ssh/sshd_config.d/01-permitrootlogin.conf`, which overrides the
+main config for this specific directive. `sshd -T` (checking the
+*effective* config) revealed the discrepancy; a genuine fresh-session
+SSH login attempt was what actually confirmed the fix once corrected.
+
+Config-file inspection alone produced false confidence here. Every
+risky control in this project (SSH-01, SSH-02, PAM-01) was verified by
+testing real authentication behavior — a fresh login attempt, a
+deliberately triggered lockout — not just by reading back the config
+file the script had written.
+
+## Limitations
+
+- Covers 12 of roughly 300+ controls in the full CIS benchmarks; scope
+  was chosen for breadth across control categories (filesystem,
+  package management, SSH, sudo, password policy, PAM, permissions,
+  networking, auditing, mandatory access control) rather than
+  exhaustive depth within any one category.
+- Level 1 (and one Level 2 — PAM-01/AUD-01/AUD-02) profile only.
+- `remediate.sh` does not implement active fixes for PERM-01, SYS-01,
+  or MAC-01 — both test images already passed these by default, so no
+  fix function was needed or written for them.
+- PW-01's remediation only affects newly created accounts and future
+  password changes; it does not retroactively modify the expiry of
+  already-existing accounts.
+- Testing was done on Rocky Linux 9.8 and Ubuntu 22.04.5 LTS
+  specifically. Behavior — especially the Anaconda SSH drop-in and PAM
+  file management approach — may differ on other point releases or on
+  cloud/minimal images built differently than these test VMs.
+- Not validated against OpenSCAP / SCAP Security Guide in this version
+  of the README — see `docs/` for updates if that validation has been
+  added since.
+
+## Requirements
+
+- Bash 4+, `shellcheck` (for development), root or sudo access on the
+  target system.
+- Tested with `sshd`, `auditd`, `pam_faillock`, and `visudo` available
+  on-system — all standard on both target distros' default installs
+  (auditd requires installation on Ubuntu, handled automatically by
+  `remediate.sh`).
