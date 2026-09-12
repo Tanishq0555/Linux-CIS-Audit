@@ -1,3 +1,72 @@
 #!/usr/bin/env bash
 # CIS remediation functions. Each fix_* function is auto-discovered by remediate.sh.
 # shellcheck disable=SC2317  # fix_* functions are invoked indirectly by name via declare -F in remediate.sh
+
+# ---------------------------------------------------------------------
+# PKG-01  Ensure GPG signature checking is enabled for package management
+# Distro:    RHEL-family only — mirrors the audit check's skip logic.
+# ---------------------------------------------------------------------
+fix_pkg_gpgcheck() {
+    local id="PKG-01"
+
+    if [[ "$DISTRO_FAMILY" != "rhel" ]]; then
+        printf '[SKIP]    %s: not applicable on %s family\n' "$id" "$DISTRO_FAMILY"
+        return
+    fi
+
+    # Rule 4: skip anything the audit already reports as PASS.
+    if grep -Eq '^\s*gpgcheck\s*=\s*1\s*$' /etc/dnf/dnf.conf 2>/dev/null; then
+        printf '[SKIP]    %s: already compliant (gpgcheck=1 in dnf.conf)\n' "$id"
+    else
+        backup_file /etc/dnf/dnf.conf
+        run "$id: set gpgcheck=1 in dnf.conf" \
+            sed -i 's/^\s*gpgcheck\s*=.*/gpgcheck=1/' /etc/dnf/dnf.conf
+    fi
+
+    # Repo files are handled separately since there can be several,
+    # each independently non-compliant or already fine.
+    local repo_file
+    for repo_file in /etc/yum.repos.d/*.repo; do
+        [[ -e "$repo_file" ]] || continue
+        if grep -Eq '^\s*gpgcheck\s*=\s*1\s*$' "$repo_file"; then
+            printf '[SKIP]    %s: %s already compliant\n' "$id" "$repo_file"
+        else
+            backup_file "$repo_file"
+            run "$id: set gpgcheck=1 in $repo_file" \
+                sed -i 's/^\s*gpgcheck\s*=.*/gpgcheck=1/' "$repo_file"
+        fi
+    done
+}
+
+# ---------------------------------------------------------------------
+# FS-01  Ensure /tmp is mounted with noexec
+# Rationale for approach: rather than repartitioning, we use a tmpfs
+# mount for /tmp — the standard, low-risk way to add noexec without
+# touching disk layout. Idempotent: checks fstab before appending so
+# running this twice does not duplicate the line.
+# ---------------------------------------------------------------------
+fix_tmp_noexec() {
+    local id="FS-01"
+    local mount_info
+    mount_info=$(findmnt -n /tmp 2>/dev/null)
+
+    if echo "$mount_info" | grep -qw "noexec"; then
+        printf '[SKIP]    %s: already compliant\n' "$id"
+        return
+    fi
+
+    if grep -q '^tmpfs\s\+/tmp\s' /etc/fstab 2>/dev/null; then
+        printf '[SKIP]    %s: /tmp entry already present in fstab (will take effect on remount/reboot)\n' "$id"
+    else
+        backup_file /etc/fstab
+        run "$id: add tmpfs /tmp entry with noexec to fstab" \
+            bash -c 'echo "tmpfs /tmp tmpfs defaults,noexec,nosuid,nodev 0 0" >> /etc/fstab'
+    fi
+
+    # Remounting live is deliberately NOT automatic — it can disrupt anything
+    # currently running out of /tmp. Applying this requires the config change
+    # to be in place, then a manual "mount /tmp" or a reboot, on your own terms.
+    if [[ $DRY_RUN -eq 0 ]]; then
+        printf '[APPLY]   %s: fstab updated. Run "sudo mount /tmp" or reboot to activate — not done automatically.\n' "$id"
+    fi
+}
