@@ -4,7 +4,6 @@
 
 # ---------------------------------------------------------------------
 # PKG-01  Ensure GPG signature checking is enabled for package management
-# Distro:    RHEL-family only — mirrors the audit check's skip logic.
 # ---------------------------------------------------------------------
 fix_pkg_gpgcheck() {
     local id="PKG-01"
@@ -14,7 +13,6 @@ fix_pkg_gpgcheck() {
         return
     fi
 
-    # Rule 4: skip anything the audit already reports as PASS.
     if grep -Eq '^\s*gpgcheck\s*=\s*1\s*$' /etc/dnf/dnf.conf 2>/dev/null; then
         printf '[SKIP]    %s: already compliant (gpgcheck=1 in dnf.conf)\n' "$id"
     else
@@ -23,8 +21,6 @@ fix_pkg_gpgcheck() {
             sed -i 's/^\s*gpgcheck\s*=.*/gpgcheck=1/' /etc/dnf/dnf.conf
     fi
 
-    # Repo files are handled separately since there can be several,
-    # each independently non-compliant or already fine.
     local repo_file
     for repo_file in /etc/yum.repos.d/*.repo; do
         [[ -e "$repo_file" ]] || continue
@@ -40,10 +36,6 @@ fix_pkg_gpgcheck() {
 
 # ---------------------------------------------------------------------
 # FS-01  Ensure /tmp is mounted with noexec
-# Rationale for approach: rather than repartitioning, we use a tmpfs
-# mount for /tmp — the standard, low-risk way to add noexec without
-# touching disk layout. Idempotent: checks fstab before appending so
-# running this twice does not duplicate the line.
 # ---------------------------------------------------------------------
 fix_tmp_noexec() {
     local id="FS-01"
@@ -63,9 +55,6 @@ fix_tmp_noexec() {
             bash -c 'echo "tmpfs /tmp tmpfs defaults,noexec,nosuid,nodev 0 0" >> /etc/fstab'
     fi
 
-    # Remounting live is deliberately NOT automatic — it can disrupt anything
-    # currently running out of /tmp. Applying this requires the config change
-    # to be in place, then a manual "mount /tmp" or a reboot, on your own terms.
     if [[ $DRY_RUN -eq 0 ]]; then
         printf '[APPLY]   %s: fstab updated. Run "sudo mount /tmp" or reboot to activate — not done automatically.\n' "$id"
     fi
@@ -73,10 +62,6 @@ fix_tmp_noexec() {
 
 # ---------------------------------------------------------------------
 # SUDO-01  Ensure sudo commands use pty
-# Safety: NEVER write directly to /etc/sudoers. A malformed sudoers file
-# breaks privilege escalation for everyone. Instead, write to a drop-in
-# file under /etc/sudoers.d/ and validate it with visudo -c BEFORE it's
-# considered live. If validation fails, the bad file is removed.
 # ---------------------------------------------------------------------
 fix_sudo_use_pty() {
     local id="SUDO-01"
@@ -92,7 +77,6 @@ fix_sudo_use_pty() {
         return
     fi
 
-    # Write to a temp file first, validate THAT, only move into place if valid.
     local tmpfile
     tmpfile=$(mktemp)
     echo "Defaults use_pty" > "$tmpfile"
@@ -130,18 +114,10 @@ fix_pw_max_days() {
         run "$id: append PASS_MAX_DAYS 365 to login.defs" \
             bash -c 'echo "PASS_MAX_DAYS   365" >> /etc/login.defs'
     fi
-
-    # Note: this only affects NEW passwords/accounts going forward.
-    # Existing users keep their current expiry unless chage is run per-user —
-    # intentionally out of scope here, since bulk-changing existing user
-    # expiry dates is a bigger decision than a benchmark default warrants.
 }
 
 # ---------------------------------------------------------------------
 # AUD-02  Ensure audit rule exists for changes to sudoers
-# Safety: augenrules validates syntax on load. A bad rule file causes
-# auditd to fail loading rules (visible in the service status), not a
-# system lockout — auditd failing doesn't block logins or sudo.
 # ---------------------------------------------------------------------
 fix_audit_sudoers_rule() {
     local id="AUD-02"
@@ -174,4 +150,76 @@ RULES
     else
         printf '[FAIL]    %s: augenrules --load reported an error — check with: augenrules --check\n' "$id" >&2
     fi
+}
+
+# ---------------------------------------------------------------------
+# PAM-01  Ensure account lockout (faillock) is configured
+# Safety: this system does NOT use authselect (system-auth/password-auth
+# are plain files, not symlinks — confirmed via `authselect current` and
+# `ls -la`), so directly editing them is correct here. On an
+# authselect-managed system (symlinked files), this function instead uses
+# `authselect enable-feature with-faillock`, the supported mechanism —
+# never hand-edit an authselect-managed file, it gets silently overwritten.
+# Applying this does NOT lock anyone out immediately: faillock only
+# triggers on a FUTURE failed login attempt, not on config write.
+# ---------------------------------------------------------------------
+fix_pam_faillock() {
+    local id="PAM-01"
+
+    if [[ "$DISTRO_FAMILY" != "rhel" ]]; then
+        printf '[SKIP]    %s: this fix currently only implemented for rhel family\n' "$id"
+        return
+    fi
+
+    local deny_value
+    deny_value=$(awk -F= '$1=="deny" {gsub(/ /,"",$2); print $2}' /etc/security/faillock.conf 2>/dev/null)
+
+    local wired=0
+    if grep -rq "pam_faillock.so" /etc/pam.d/system-auth /etc/pam.d/password-auth 2>/dev/null; then
+        wired=1
+    fi
+
+    if [[ -n "$deny_value" ]] && [[ "$deny_value" -ne 0 ]] && [[ $wired -eq 1 ]]; then
+        printf '[SKIP]    %s: already compliant\n' "$id"
+        return
+    fi
+
+    if [[ $DRY_RUN -eq 1 ]]; then
+        printf '[DRY-RUN] %s: would set deny=5 in faillock.conf and wire pam_faillock.so into the PAM stack\n' "$id"
+        return
+    fi
+
+    backup_file /etc/security/faillock.conf
+    if grep -Eq '^\s*deny\s*=' /etc/security/faillock.conf 2>/dev/null; then
+        sed -i 's/^\s*deny\s*=.*/deny = 5/' /etc/security/faillock.conf
+    else
+        echo "deny = 5" >> /etc/security/faillock.conf
+    fi
+    printf '[APPLY]   %s: set deny=5 in faillock.conf\n' "$id"
+
+    if [[ $wired -eq 1 ]]; then
+        return
+    fi
+
+    if [[ -L /etc/pam.d/system-auth ]]; then
+        if authselect enable-feature with-faillock 2>&1; then
+            printf '[APPLY]   %s: enabled with-faillock via authselect\n' "$id"
+        else
+            printf '[FAIL]    %s: authselect enable-feature failed — check: authselect current\n' "$id" >&2
+        fi
+        return
+    fi
+
+    local pf
+    for pf in /etc/pam.d/system-auth /etc/pam.d/password-auth; do
+        backup_file "$pf"
+        sed -i \
+            -e '/^auth\s\+sufficient\s\+pam_unix\.so/i auth        required      pam_faillock.so preauth silent deny=5 unlock_time=900' \
+            -e '/^auth\s\+sufficient\s\+pam_unix\.so/a auth        [default=die] pam_faillock.so authfail deny=5 unlock_time=900' \
+            "$pf"
+        sed -i \
+            -e '/^account\s\+required\s\+pam_unix\.so/i account     required      pam_faillock.so' \
+            "$pf"
+        printf '[APPLY]   %s: wired pam_faillock.so into %s\n' "$id" "$pf"
+    done
 }
