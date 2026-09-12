@@ -70,3 +70,40 @@ fix_tmp_noexec() {
         printf '[APPLY]   %s: fstab updated. Run "sudo mount /tmp" or reboot to activate — not done automatically.\n' "$id"
     fi
 }
+
+# ---------------------------------------------------------------------
+# SUDO-01  Ensure sudo commands use pty
+# Safety: NEVER write directly to /etc/sudoers. A malformed sudoers file
+# breaks privilege escalation for everyone. Instead, write to a drop-in
+# file under /etc/sudoers.d/ and validate it with visudo -c BEFORE it's
+# considered live. If validation fails, the bad file is removed.
+# ---------------------------------------------------------------------
+fix_sudo_use_pty() {
+    local id="SUDO-01"
+    local dropin="/etc/sudoers.d/99-cis-use-pty"
+
+    if grep -Eq '^\s*Defaults\s+use_pty\s*$' /etc/sudoers /etc/sudoers.d/* 2>/dev/null; then
+        printf '[SKIP]    %s: already compliant\n' "$id"
+        return
+    fi
+
+    if [[ $DRY_RUN -eq 1 ]]; then
+        printf '[DRY-RUN] %s: would create %s with "Defaults use_pty" and validate via visudo -c\n' "$id" "$dropin"
+        return
+    fi
+
+    # Write to a temp file first, validate THAT, only move into place if valid.
+    local tmpfile
+    tmpfile=$(mktemp)
+    echo "Defaults use_pty" > "$tmpfile"
+    chmod 0440 "$tmpfile"
+
+    if visudo -c -f "$tmpfile" >/dev/null 2>&1; then
+        mv "$tmpfile" "$dropin"
+        chmod 0440 "$dropin"
+        printf '[APPLY]   %s: created %s (validated with visudo -c)\n' "$id" "$dropin"
+    else
+        rm -f "$tmpfile"
+        printf '[FAIL]    %s: validation failed, no changes made\n' "$id" >&2
+    fi
+}
