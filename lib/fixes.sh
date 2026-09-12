@@ -117,6 +117,50 @@ fix_pw_max_days() {
 }
 
 # ---------------------------------------------------------------------
+# AUD-01  Ensure auditd is installed and enabled
+# Distro: NOT installed by default on minimal Ubuntu, unlike Rocky.
+# ---------------------------------------------------------------------
+fix_auditd_enabled() {
+    local id="AUD-01"
+
+    if command -v auditctl >/dev/null 2>&1; then
+        local state
+        state=$(systemctl is-enabled auditd 2>/dev/null)
+        if [[ "$state" == "enabled" ]]; then
+            printf '[SKIP]    %s: already compliant\n' "$id"
+            return
+        fi
+    fi
+
+    if [[ $DRY_RUN -eq 1 ]]; then
+        printf '[DRY-RUN] %s: would install auditd package and enable the service\n' "$id"
+        return
+    fi
+
+    if [[ "$DISTRO_FAMILY" == "debian" ]]; then
+        if apt-get install -y auditd >/tmp/auditd_install.log 2>&1; then
+            printf '[APPLY]   %s: installed auditd\n' "$id"
+        else
+            printf '[FAIL]    %s: apt-get install failed — see /tmp/auditd_install.log\n' "$id" >&2
+            return
+        fi
+    elif [[ "$DISTRO_FAMILY" == "rhel" ]]; then
+        if dnf install -y audit >/tmp/auditd_install.log 2>&1; then
+            printf '[APPLY]   %s: installed audit\n' "$id"
+        else
+            printf '[FAIL]    %s: dnf install failed — see /tmp/auditd_install.log\n' "$id" >&2
+            return
+        fi
+    fi
+
+    if systemctl enable --now auditd >/dev/null 2>&1; then
+        printf '[APPLY]   %s: auditd enabled and started\n' "$id"
+    else
+        printf '[FAIL]    %s: systemctl enable --now auditd failed\n' "$id" >&2
+    fi
+}
+
+# ---------------------------------------------------------------------
 # AUD-02  Ensure audit rule exists for changes to sudoers
 # ---------------------------------------------------------------------
 fix_audit_sudoers_rule() {
@@ -154,27 +198,31 @@ RULES
 
 # ---------------------------------------------------------------------
 # PAM-01  Ensure account lockout (faillock) is configured
-# Safety: this system does NOT use authselect (system-auth/password-auth
-# are plain files, not symlinks). even_deny_root is required -- pam_faillock
-# silently EXEMPTS root from lockout by default. Verified this the hard way:
-# 5 wrong root passwords produced zero faillock entries until this flag was
-# added. Without it, the control looks configured but does not protect the
-# account most worth protecting here.
+# Safety, RHEL: system-auth/password-auth are plain files (not authselect
+# symlinks) on this image -- direct edit confirmed correct via ls -la.
+# even_deny_root required -- pam_faillock silently EXEMPTS root from
+# lockout by default (verified: 5 wrong root passwords produced zero
+# faillock entries until this flag was added).
+# Safety, Debian: common-auth/common-account are managed by pam-auth-update,
+# but their own header text explicitly says local modules can be added
+# before/after the managed block -- direct edits here are the documented,
+# supported approach, unlike Rocky's authselect-managed files.
 # ---------------------------------------------------------------------
 fix_pam_faillock() {
     local id="PAM-01"
-
-    if [[ "$DISTRO_FAMILY" != "rhel" ]]; then
-        printf '[SKIP]    %s: this fix currently only implemented for rhel family\n' "$id"
-        return
-    fi
 
     local deny_value
     deny_value=$(awk -F= '{gsub(/ /,"",$1); if ($1=="deny") {gsub(/ /,"",$2); print $2}}' /etc/security/faillock.conf 2>/dev/null)
 
     local wired=0
-    if grep -rq "pam_faillock.so" /etc/pam.d/system-auth /etc/pam.d/password-auth 2>/dev/null; then
-        wired=1
+    if [[ "$DISTRO_FAMILY" == "rhel" ]]; then
+        if grep -rq "pam_faillock.so" /etc/pam.d/system-auth /etc/pam.d/password-auth 2>/dev/null; then
+            wired=1
+        fi
+    elif [[ "$DISTRO_FAMILY" == "debian" ]]; then
+        if grep -q "pam_faillock.so" /etc/pam.d/common-auth 2>/dev/null; then
+            wired=1
+        fi
     fi
 
     if [[ -n "$deny_value" ]] && [[ "$deny_value" -ne 0 ]] && [[ $wired -eq 1 ]]; then
@@ -199,27 +247,44 @@ fix_pam_faillock() {
         return
     fi
 
-    if [[ -L /etc/pam.d/system-auth ]]; then
-        if authselect enable-feature with-faillock 2>&1; then
-            printf '[APPLY]   %s: enabled with-faillock via authselect\n' "$id"
-        else
-            printf '[FAIL]    %s: authselect enable-feature failed — check: authselect current\n' "$id" >&2
+    if [[ "$DISTRO_FAMILY" == "rhel" ]]; then
+        if [[ -L /etc/pam.d/system-auth ]]; then
+            if authselect enable-feature with-faillock 2>&1; then
+                printf '[APPLY]   %s: enabled with-faillock via authselect\n' "$id"
+            else
+                printf '[FAIL]    %s: authselect enable-feature failed — check: authselect current\n' "$id" >&2
+            fi
+            return
         fi
-        return
-    fi
 
-    local pf
-    for pf in /etc/pam.d/system-auth /etc/pam.d/password-auth; do
-        backup_file "$pf"
+        local pf
+        for pf in /etc/pam.d/system-auth /etc/pam.d/password-auth; do
+            backup_file "$pf"
+            sed -i \
+                -e '/^auth\s\+sufficient\s\+pam_unix\.so/i auth        required      pam_faillock.so preauth silent deny=5 unlock_time=900 even_deny_root' \
+                -e '/^auth\s\+sufficient\s\+pam_unix\.so/a auth        [default=die] pam_faillock.so authfail deny=5 unlock_time=900 even_deny_root' \
+                "$pf"
+            sed -i \
+                -e '/^account\s\+required\s\+pam_unix\.so/i account     required      pam_faillock.so' \
+                "$pf"
+            printf '[APPLY]   %s: wired pam_faillock.so into %s\n' "$id" "$pf"
+        done
+
+    elif [[ "$DISTRO_FAMILY" == "debian" ]]; then
+        backup_file /etc/pam.d/common-auth
+        backup_file /etc/pam.d/common-account
+
         sed -i \
-            -e '/^auth\s\+sufficient\s\+pam_unix\.so/i auth        required      pam_faillock.so preauth silent deny=5 unlock_time=900 even_deny_root' \
-            -e '/^auth\s\+sufficient\s\+pam_unix\.so/a auth        [default=die] pam_faillock.so authfail deny=5 unlock_time=900 even_deny_root' \
-            "$pf"
+            -e '/^auth\s\+\[success=1 default=ignore\]\s\+pam_unix\.so/i auth        required      pam_faillock.so preauth silent deny=5 unlock_time=900 even_deny_root' \
+            -e '/^auth\s\+\[success=1 default=ignore\]\s\+pam_unix\.so/a auth        [default=die] pam_faillock.so authfail deny=5 unlock_time=900 even_deny_root' \
+            /etc/pam.d/common-auth
+
         sed -i \
-            -e '/^account\s\+required\s\+pam_unix\.so/i account     required      pam_faillock.so' \
-            "$pf"
-        printf '[APPLY]   %s: wired pam_faillock.so into %s\n' "$id" "$pf"
-    done
+            -e '/^account\s\+\[success=1 new_authtok_reqd=done default=ignore\]\s\+pam_unix\.so/i account     required      pam_faillock.so' \
+            /etc/pam.d/common-account
+
+        printf '[APPLY]   %s: wired pam_faillock.so into common-auth and common-account\n' "$id"
+    fi
 }
 
 # ---------------------------------------------------------------------
@@ -254,7 +319,8 @@ fix_ssh_hardening() {
     # directive regardless of what we set there. Confirmed via sshd -T
     # returning yes even after editing sshd_config directly. The file's own
     # comment says "Remove this file to opt-out" -- following that documented
-    # convention rather than editing it, after backing it up.
+    # convention rather than editing it, after backing it up. Not present on
+    # Ubuntu; the check is a harmless no-op there.
     local anaconda_dropin="/etc/ssh/sshd_config.d/01-permitrootlogin.conf"
 
     if [[ $DRY_RUN -eq 1 ]]; then
