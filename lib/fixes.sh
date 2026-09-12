@@ -136,3 +136,42 @@ fix_pw_max_days() {
     # intentionally out of scope here, since bulk-changing existing user
     # expiry dates is a bigger decision than a benchmark default warrants.
 }
+
+# ---------------------------------------------------------------------
+# AUD-02  Ensure audit rule exists for changes to sudoers
+# Safety: augenrules validates syntax on load. A bad rule file causes
+# auditd to fail loading rules (visible in the service status), not a
+# system lockout — auditd failing doesn't block logins or sudo.
+# ---------------------------------------------------------------------
+fix_audit_sudoers_rule() {
+    local id="AUD-02"
+    local rule_file="/etc/audit/rules.d/50-sudoers.rules"
+
+    if ! command -v auditctl >/dev/null 2>&1; then
+        printf '[SKIP]    %s: auditd not installed\n' "$id"
+        return
+    fi
+
+    if grep -rq "/etc/sudoers" /etc/audit/rules.d/ 2>/dev/null; then
+        printf '[SKIP]    %s: already compliant\n' "$id"
+        return
+    fi
+
+    if [[ $DRY_RUN -eq 1 ]]; then
+        printf '[DRY-RUN] %s: would create %s watching /etc/sudoers and /etc/sudoers.d/\n' "$id" "$rule_file"
+        return
+    fi
+
+    cat > "$rule_file" <<'RULES'
+-w /etc/sudoers -p wa -k sudoers_changes
+-w /etc/sudoers.d/ -p wa -k sudoers_changes
+RULES
+
+    printf '[APPLY]   %s: created %s\n' "$id" "$rule_file"
+
+    if augenrules --load >/dev/null 2>&1; then
+        printf '[APPLY]   %s: audit rules reloaded successfully\n' "$id"
+    else
+        printf '[FAIL]    %s: augenrules --load reported an error — check with: augenrules --check\n' "$id" >&2
+    fi
+}
