@@ -107,3 +107,32 @@ fix_sudo_use_pty() {
         printf '[FAIL]    %s: validation failed, no changes made\n' "$id" >&2
     fi
 }
+
+# ---------------------------------------------------------------------
+# PW-01  Ensure password max age is 365 days or less
+# ---------------------------------------------------------------------
+fix_pw_max_days() {
+    local id="PW-01"
+    local value
+    value=$(awk '$1=="PASS_MAX_DAYS" {print $2}' /etc/login.defs 2>/dev/null)
+
+    if [[ "$value" =~ ^[0-9]+$ ]] && [[ "$value" -le 365 ]]; then
+        printf '[SKIP]    %s: already compliant (PASS_MAX_DAYS=%s)\n' "$id" "$value"
+        return
+    fi
+
+    backup_file /etc/login.defs
+
+    if grep -Eq '^\s*PASS_MAX_DAYS\s+' /etc/login.defs; then
+        run "$id: set PASS_MAX_DAYS to 365 in login.defs" \
+            sed -i 's/^\s*PASS_MAX_DAYS\s\+.*/PASS_MAX_DAYS   365/' /etc/login.defs
+    else
+        run "$id: append PASS_MAX_DAYS 365 to login.defs" \
+            bash -c 'echo "PASS_MAX_DAYS   365" >> /etc/login.defs'
+    fi
+
+    # Note: this only affects NEW passwords/accounts going forward.
+    # Existing users keep their current expiry unless chage is run per-user —
+    # intentionally out of scope here, since bulk-changing existing user
+    # expiry dates is a bigger decision than a benchmark default warrants.
+}
