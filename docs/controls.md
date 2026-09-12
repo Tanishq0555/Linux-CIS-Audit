@@ -222,7 +222,7 @@ expiry is bigger than a benchmark default should make unilaterally).
 
 ## PAM-01 — Ensure account lockout (faillock) is configured
 
-**CIS ID:** 5.3.3.1 (Rocky) · 5.3.2.2 (Ubuntu)
+**CIS ID:** 5.3.3.1.1 (Rocky) · 5.3.2.2 (Ubuntu)
 
 **Description:** `pam_faillock` locks an account out after a configured
 number of consecutive failed authentication attempts.
@@ -283,7 +283,7 @@ confirming lockout and reset behavior against fresh login attempts.
 
 ## PERM-01 — Ensure permissions on /etc/shadow are configured
 
-**CIS ID:** 6.2.3.14 (identical on both benchmarks)
+**CIS ID:** 7.1.5 (identical on both benchmarks)
 
 **Description:** `/etc/shadow` holds password hashes for every local
 account.
@@ -319,7 +319,7 @@ was failing, and manually confirming the real permissions were correct.
 
 ## SYS-01 — Ensure IP forwarding is disabled
 
-**CIS ID:** 3.3.1.3 (Rocky) · 3.3.1.1 (Ubuntu)
+**CIS ID:** 3.3.1.1 (identical on both benchmarks)
 
 **Description:** `net.ipv4.ip_forward` controls whether the kernel
 routes packets between network interfaces — i.e., whether this host can
@@ -354,7 +354,7 @@ same audit approach worked unmodified on both distros.
 
 ## AUD-01 — Ensure auditd is installed and enabled
 
-**CIS ID:** 6.2.1.1 (identical on both benchmarks)
+**CIS ID:** 6.2.1.4 (Rocky) · 6.2.1.2 (Ubuntu)
 
 **Description:** `auditd` provides tamper-evident logging of
 security-relevant kernel and system events.
@@ -383,7 +383,7 @@ divergence found in the whole project.
 
 ## AUD-02 — Ensure audit rule exists for changes to sudoers
 
-**CIS ID:** 6.2.3.2 (identical on both benchmarks)
+**CIS ID:** 6.2.3.1 (identical on both benchmarks)
 
 **Description:** An audit watch rule on `/etc/sudoers` and
 `/etc/sudoers.d/` logs any modification to sudo privilege configuration.
@@ -455,11 +455,11 @@ tooling, different policy languages, and different failure modes.
 | SSH-02 | MaxAuthTries | 5.1.17 | 5.1.18 | FAIL | FAIL |
 | SUDO-01 | use_pty | 5.2.4 | 5.2.2 | FAIL | PASS |
 | PW-01 | PASS_MAX_DAYS | 5.4.1.1 | 5.4.1.1 | FAIL | FAIL |
-| PAM-01 | faillock | 5.3.3.1 | 5.3.2.2 | FAIL | FAIL |
-| PERM-01 | /etc/shadow perms | 6.2.3.14 | 6.2.3.14 | PASS | PASS |
-| SYS-01 | ip_forward | 3.3.1.3 | 3.3.1.1 | PASS | PASS |
-| AUD-01 | auditd installed | 6.2.1.1 | 6.2.1.1 | PASS | FAIL |
-| AUD-02 | sudoers audit rule | 6.2.3.2 | 6.2.3.2 | FAIL | SKIP (cascades from AUD-01) |
+| PAM-01 | faillock | 5.3.3.1.1 | 5.3.2.2 | FAIL | FAIL |
+| PERM-01 | /etc/shadow perms | 7.1.5 | 7.1.5 | PASS | PASS |
+| SYS-01 | ip_forward | 3.3.1.1 | 3.3.1.1 | PASS | PASS |
+| AUD-01 | auditd installed | 6.2.1.4 | 6.2.1.2 | PASS | FAIL |
+| AUD-02 | sudoers audit rule | 6.2.3.1 | 6.2.3.1 | FAIL | SKIP (cascades from AUD-01) |
 | MAC-01 | SELinux/AppArmor | 1.3.1.5 | 1.3.1.2 | PASS | PASS |
 
 All twelve controls PASS on both distros after remediation (PKG-01
