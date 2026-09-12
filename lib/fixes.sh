@@ -155,13 +155,11 @@ RULES
 # ---------------------------------------------------------------------
 # PAM-01  Ensure account lockout (faillock) is configured
 # Safety: this system does NOT use authselect (system-auth/password-auth
-# are plain files, not symlinks — confirmed via `authselect current` and
-# `ls -la`), so directly editing them is correct here. On an
-# authselect-managed system (symlinked files), this function instead uses
-# `authselect enable-feature with-faillock`, the supported mechanism —
-# never hand-edit an authselect-managed file, it gets silently overwritten.
-# Applying this does NOT lock anyone out immediately: faillock only
-# triggers on a FUTURE failed login attempt, not on config write.
+# are plain files, not symlinks). even_deny_root is required -- pam_faillock
+# silently EXEMPTS root from lockout by default. Verified this the hard way:
+# 5 wrong root passwords produced zero faillock entries until this flag was
+# added. Without it, the control looks configured but does not protect the
+# account most worth protecting here.
 # ---------------------------------------------------------------------
 fix_pam_faillock() {
     local id="PAM-01"
@@ -222,4 +220,93 @@ fix_pam_faillock() {
             "$pf"
         printf '[APPLY]   %s: wired pam_faillock.so into %s\n' "$id" "$pf"
     done
+}
+
+# ---------------------------------------------------------------------
+# SSH-01 / SSH-02  Disable root login, limit auth tries
+# Safety: sshd -t validates config syntax BEFORE any restart. A bad
+# config here means sshd refuses to reload -- your CURRENT session
+# stays alive either way, since restarting sshd does not kill existing
+# connections, only affects NEW ones. Restart only happens if
+# validation passes. Applying this REQUIRES a working non-root sudo
+# account already verified -- root SSH access is cut off permanently
+# for anyone without one.
+# ---------------------------------------------------------------------
+fix_ssh_hardening() {
+    local id="SSH-01/02"
+    local root_value maxauth_value
+    root_value=$(sshd -T 2>/dev/null | awk '$1=="permitrootlogin" {print $2}')
+    maxauth_value=$(sshd -T 2>/dev/null | awk '$1=="maxauthtries" {print $2}')
+
+    local needs_root_fix=0 needs_maxauth_fix=0
+    [[ "$root_value" != "no" ]] && needs_root_fix=1
+    if ! [[ "$maxauth_value" =~ ^[0-9]+$ ]] || [[ "$maxauth_value" -gt 4 ]]; then
+        needs_maxauth_fix=1
+    fi
+
+    if [[ $needs_root_fix -eq 0 ]] && [[ $needs_maxauth_fix -eq 0 ]]; then
+        printf '[SKIP]    %s: already compliant\n' "$id"
+        return
+    fi
+
+    # Anaconda (the Rocky/RHEL installer) generates a drop-in that force-sets
+    # PermitRootLogin yes, which OVERRIDES the main sshd_config for this
+    # directive regardless of what we set there. Confirmed via sshd -T
+    # returning yes even after editing sshd_config directly. The file's own
+    # comment says "Remove this file to opt-out" -- following that documented
+    # convention rather than editing it, after backing it up.
+    local anaconda_dropin="/etc/ssh/sshd_config.d/01-permitrootlogin.conf"
+
+    if [[ $DRY_RUN -eq 1 ]]; then
+        if [[ -f "$anaconda_dropin" ]] && [[ $needs_root_fix -eq 1 ]]; then
+            printf '[DRY-RUN] %s: would remove %s (Anaconda default that overrides PermitRootLogin)\n' "$id" "$anaconda_dropin"
+        fi
+        printf '[DRY-RUN] %s: would set PermitRootLogin no and MaxAuthTries 4 in sshd_config, validate with sshd -t, then restart sshd\n' "$id"
+        return
+    fi
+
+    backup_file /etc/ssh/sshd_config
+
+    if [[ -f "$anaconda_dropin" ]] && [[ $needs_root_fix -eq 1 ]]; then
+        backup_file "$anaconda_dropin"
+        rm -f "$anaconda_dropin"
+        printf '[APPLY]   %s: removed %s (Anaconda default that overrides PermitRootLogin no)\n' "$id" "$anaconda_dropin"
+    fi
+
+    local tmpfile
+    tmpfile=$(mktemp)
+    cp /etc/ssh/sshd_config "$tmpfile"
+
+    if [[ $needs_root_fix -eq 1 ]]; then
+        if grep -Eq '^\s*#?\s*PermitRootLogin\s+' "$tmpfile"; then
+            sed -i 's/^\s*#\?\s*PermitRootLogin\s\+.*/PermitRootLogin no/' "$tmpfile"
+        else
+            echo "PermitRootLogin no" >> "$tmpfile"
+        fi
+    fi
+
+    if [[ $needs_maxauth_fix -eq 1 ]]; then
+        if grep -Eq '^\s*#?\s*MaxAuthTries\s+' "$tmpfile"; then
+            sed -i 's/^\s*#\?\s*MaxAuthTries\s\+.*/MaxAuthTries 4/' "$tmpfile"
+        else
+            echo "MaxAuthTries 4" >> "$tmpfile"
+        fi
+    fi
+
+    # Validate the EDITED COPY before touching the real file.
+    if sshd -t -f "$tmpfile" 2>/tmp/sshd_validate_err; then
+        cp "$tmpfile" /etc/ssh/sshd_config
+        rm -f "$tmpfile"
+        printf '[APPLY]   %s: sshd_config updated and validated\n' "$id"
+
+        if systemctl reload sshd 2>/dev/null; then
+            printf '[APPLY]   %s: sshd reloaded (existing sessions unaffected, new connections use new rules)\n' "$id"
+        else
+            printf '[FAIL]    %s: sshd reload failed — check: systemctl status sshd\n' "$id" >&2
+        fi
+    else
+        printf '[FAIL]    %s: validation failed, no changes made. Details:\n' "$id" >&2
+        cat /tmp/sshd_validate_err >&2
+        rm -f "$tmpfile"
+    fi
 }
